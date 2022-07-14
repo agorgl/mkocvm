@@ -1,0 +1,31 @@
+#!/usr/bin/env python
+import sys
+import json
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+
+def etree_to_dict(t):
+    if t.tag == 'dict':
+        return {k.text: etree_to_dict(v) for k,v in zip(t[::2], t[1::2])}
+    elif t.tag == 'array':
+        return [etree_to_dict(c) for c in t]
+    elif t.tag == 'string':
+        return t.text
+    elif t.tag == 'data':
+        return '<' + str(t.text or '') + '>'
+    elif t.tag == 'integer':
+        return int(t.text)
+    elif t.tag == 'false' or t.tag == 'true':
+        return t.tag.lower() == 'true'
+    else:
+        return t.text
+
+def plist_to_json(source):
+    root = ET.parse(source).getroot()
+    dict = etree_to_dict(list(root)[0])
+    data = json.dumps(dict, indent=2)
+    return data
+
+if __name__ == '__main__':
+    r = plist_to_json(sys.argv[1] if len(sys.argv) > 1 else sys.stdin)
+    print(r)
