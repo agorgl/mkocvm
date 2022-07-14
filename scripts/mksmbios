@@ -1,0 +1,72 @@
+#!/bin/bash
+set -e
+shopt -s extglob nullglob
+
+cache_dir=cache
+opencore_dir=$cache_dir/OpenCorePkg-master
+macserial_dir=$opencore_dir/Utilities/macserial
+macserial_bin=$macserial_dir/macserial
+rom_prefixes_json=rom_prefixes.json
+
+fetch_opencore() {
+    if [ ! -d $opencore_dir ]; then
+        curl -s -L --create-dirs --output-dir $cache_dir -o OpenCorePkg-master.zip https://github.com/acidanthera/OpenCorePkg/archive/refs/heads/master.zip
+        7z x $cache_dir/OpenCorePkg-master.zip -o$cache_dir >/dev/null
+    fi
+}
+
+build_macserial() {
+    if [ ! -f $macserial_bin ]; then
+        make -C $macserial_dir >/dev/null
+    fi
+}
+
+generate_rom() {
+    if [ ! -f $cache_dir/$rom_prefixes_json ]; then
+        curl -s -L --create-dirs --output-dir $cache_dir -o $rom_prefixes_json https://raw.githubusercontent.com/corpnewt/GenSMBIOS/master/Scripts/prefix.json
+    fi
+    local prefix=$(jq -r --arg i $(($RANDOM % $(jq length $cache_dir/$rom_prefixes_json))) '.[$i|tonumber]' $cache_dir/$rom_prefixes_json)
+    local random=$(openssl rand -hex 16)
+    local rom="${prefix}${random^^}"
+    echo "<${rom:0:12}>"
+}
+
+generate_smbios() {
+    local model=$1
+    echo $model
+
+    $macserial_bin -g -m "$model" 2> /dev/null \
+        | head -n 1 \
+        | awk -F ' |' '{print $1; print $3}'
+
+    local uuid=$(uuidgen)
+    echo ${uuid^^}
+
+    generate_rom
+}
+
+entrypoint() {
+    local model=${1:-"iMacPro1,1"}
+
+    fetch_opencore
+    build_macserial
+
+    local smbios=($(generate_smbios $model))
+    jq -n \
+        --arg product "${smbios[0]}" \
+        --arg serial "${smbios[1]}" \
+        --arg mlb "${smbios[2]}" \
+        --arg uuid "${smbios[3]}" \
+        --arg rom "${smbios[4]}" \
+    '
+    {
+        SystemProductName: $product,
+        SystemSerialNumber: $serial,
+        MLB: $mlb,
+        SystemUUID: $uuid,
+        ROM: $rom
+    }
+    '
+}
+
+entrypoint $@
