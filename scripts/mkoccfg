@@ -1,0 +1,82 @@
+#!/bin/bash
+
+SSDTS=("SSDT-EC.aml")
+KEXTS=("Lilu.kext" "VirtualSMC.kext" "WhateverGreen.kext" "AppleALC.kext")
+DRVRS=("HfsPlus.efi" "OpenRuntime.efi" "OpenCanopy.efi")
+TOOLS=("OpenShell.efi")
+
+SSDTS_JSON=$(echo ${SSDTS[@]} | tr " " "\n" | jq -R '
+  {
+    Comment: .,
+    Enabled: true,
+    Path: .
+  }
+')
+
+KEXTS_JSON=$(echo ${KEXTS[@]} | tr " " "\n" | jq -R '
+  {
+    Arch: "x86_64",
+    BundlePath: .,
+    Comment: .,
+    Enabled: true,
+    ExecutablePath: ("Contents/MacOS/" + sub(".kext"; "")),
+    MaxKernel: null,
+    MinKernel: null,
+    PlistPath: "Contents/Info.plist"
+  }
+')
+
+DRIVERS_JSON=$(echo ${DRVRS[@]} | tr " " "\n" | jq -R '
+  {
+    Arguments: null,
+    Comment: .,
+    Enabled: true,
+    Path: .
+  }
+')
+
+TOOLS_JSON=$(echo ${TOOLS[@]} | tr " " "\n" | jq -R '
+  {
+    Arguments: null,
+    Auxiliary: true,
+    Comment: .,
+    Enabled: true,
+    Flavour: "Auto",
+    Name: .,
+    Path: .,
+    RealPath: false,
+    TextMode: false
+  }
+')
+
+SMBIOS_JSON=$(mksmbios "iMac17,1")
+
+cat $1 | jq \
+    --slurpfile ssdts <(echo "$SSDTS_JSON") \
+    --slurpfile kexts <(echo "$KEXTS_JSON") \
+    --slurpfile drivers <(echo "$DRIVERS_JSON") \
+    --slurpfile tools <(echo "$TOOLS_JSON") \
+    --slurpfile smbios <(echo "$SMBIOS_JSON") \
+    ' .
+    | with_entries(select(.key | startswith("#WARNING") | not))
+    | .ACPI.Add = $ssdts
+    | .Kernel.Add = $kexts
+    | .UEFI.Drivers = $drivers
+    | .Misc.Tools = $tools
+    | .Misc.Boot.PickerMode = "External"
+    | .Misc.Boot.PickerAttributes = 17
+    | .Misc.Boot.HideAuxiliary = false
+    | .Misc.Debug.AppleDebug = true
+    | .Misc.Debug.ApplePanic = true
+    | .Misc.Debug.DisableWatchDog = true
+    | .Misc.Debug.Target = 67
+    | .Misc.Security.AllowNvramReset = true
+    | .Misc.Security.AllowSetDefault = true
+    | .Misc.Security.ScanPolicy = 0
+    | .Misc.Security.SecureBootModel = "Disabled"
+    | .Misc.Security.Vault = "Optional"
+    | .Booter.Quirks.DevirtualiseMmio = false
+    | .NVRAM.Add."7C436110-AB2A-4BBB-A880-FE41995C9F82"."boot-args" = "-v keepsyms=1 alcid=1 tlbto_us=0 vti=9"
+    | .NVRAM.Add."7C436110-AB2A-4BBB-A880-FE41995C9F82"."prev-lang:kbd" = "en-US:0"
+    | .PlatformInfo.Generic *= if (.PlatformInfo.Generic.SystemProductName != $smbios[0].SystemProductName or .PlatformInfo.Generic.SystemUUID == "00000000-0000-0000-0000-000000000000") then $smbios[0] else {} end
+    '
