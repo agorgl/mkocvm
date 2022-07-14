@@ -1,0 +1,173 @@
+#!/bin/bash
+set -e
+shopt -s extglob nullglob
+
+cache_dir=cache
+
+trace() { echo " -  $@"; }
+info() { echo "[+] $@"; }
+
+extract() {
+    local tmp=$(mktemp -d)
+    7z x $1 $2 -o$tmp >/dev/null
+    cp -r $tmp/$2 $3
+    rm -rf $tmp
+}
+
+download() {
+    local url="$1"
+    local ofile=${2:-$(basename "$url")}
+    if [ ! -f $cache_dir/$ofile ]; then
+        trace "Downloading $ofile from $url"
+        curl -s -L --create-dirs --output-dir $cache_dir -o $ofile "$url"
+    else
+        trace "Cache contains $ofile, skipping"
+    fi
+}
+
+release_url() {
+    local repo=$1
+    local relfile=${repo/\//.}
+    if [ ! -f $cache_dir/$relfile ]; then
+        curl -s -H 'Accept: application/vnd.github.v3+json' \
+            --create-dirs --output-dir $cache_dir -o $relfile \
+            https://api.github.com/repos/$repo/releases\?per_page=1
+    fi
+    jq -r '.[].assets[] | select(.name | contains("DEBUG")) | .browser_download_url' $cache_dir/$relfile
+}
+
+fetch_opencore() {
+    local url=$(release_url acidanthera/OpenCorePkg)
+    download $url
+}
+
+fetch_resources() {
+    download https://github.com/acidanthera/OcBinaryData/archive/refs/heads/master.zip OcBinaryData.zip
+}
+
+fetch_kexts() {
+    local kexts=(
+        VirtualSMC
+        Lilu
+        WhateverGreen
+        AppleALC
+        BrcmPatchRAM
+    )
+    for repo in ${kexts[@]}; do
+        local url=$(release_url acidanthera/$repo)
+        download $url
+    done
+}
+
+fetch_drivers() {
+    download 'https://github.com/acidanthera/OcBinaryData/blob/master/Drivers/HfsPlus.efi?raw=true' HfsPlus.efi
+}
+
+fetch_ssdt() {
+    download 'https://github.com/dortania/Getting-Started-With-ACPI/blob/master/extra-files/compiled/SSDT-EC-DESKTOP.aml?raw=true' SSDT-EC.aml
+}
+
+fetch_artifacts() {
+    fetch_opencore
+    fetch_resources
+    fetch_kexts
+    fetch_drivers
+    fetch_ssdt
+}
+
+make_img() {
+    local img=$1
+
+    trace "Creating raw image"
+    qemu-img create -f raw $img 256M
+
+    trace "Creating image partitions"
+    sgdisk --clear $img
+    sgdisk --new=1:0:0 --typecode=1:0700 --change-name=1:EFI $img
+
+    trace "Removing leftover mounts"
+    local oldlo=$(losetup -a | grep $(readlink -f $img) | awk -F: '{print $1}')
+    [ ! -z $oldlo ] && sudo losetup -d $oldlo
+
+    trace "Mounting image"
+    local lodev=$(sudo losetup --show -f $img)
+
+    trace "Formatting image"
+    sudo mkfs.vfat -F32 -n EFI "${lodev}p1"
+
+    trace "Probing system for partition table changes"
+    sudo partprobe $lodev
+
+    trace "Mounting image partition"
+    udisksctl mount -b "${lodev}p1"
+}
+
+prepare_img() {
+    local img=$1
+
+    local lodev=$(losetup -a | grep $(readlink -f $img) | awk -F: '{print $1}')
+    if [ -z $lodev ]; then
+        local lodev=$(sudo losetup --show -f $img)
+    fi
+    sleep 1
+
+    local lomnt=$(udisksctl info -b "${lodev}p1" | awk '/MountPoints/{print $2}')
+    if [ -z $lomnt ]; then
+        udisksctl mount -b "${lodev}p1"
+        local lomnt=$(udisksctl info -b "${lodev}p1" | awk '/MountPoints/{print $2}')
+    fi
+
+    if [ ! -d $lomnt/EFI ]; then
+        trace "Copying opencore package files"
+        extract $cache_dir/OpenCore*.zip 'X64/EFI' $lomnt
+    fi
+
+    trace "Removing unnecessary opencore files"
+    local udrivers=($lomnt/EFI/OC/Drivers/!(OpenRuntime.efi|OpenCanopy.efi|HfsPlus.efi))
+    if [ ! ${#udrivers[@]} -eq 0 ]; then
+        rm -v ${udrivers[@]}
+    fi
+    local utools=($lomnt/EFI/OC/Tools/!(OpenShell.efi))
+    if [ ! ${#utools[@]} -eq 0 ]; then
+        rm -v ${utools[@]}
+    fi
+
+    trace "Copying resource files"
+    extract $cache_dir/OcBinaryData.zip "OcBinaryData-master/Resources/" $lomnt/EFI/OC
+
+    trace "Copying kexts"
+    extract $cache_dir/Lilu*.zip "Lilu.kext" $lomnt/EFI/OC/Kexts
+    extract $cache_dir/VirtualSMC*.zip "Kexts/VirtualSMC.kext" $lomnt/EFI/OC/Kexts
+    extract $cache_dir/WhateverGreen*.zip "WhateverGreen.kext" $lomnt/EFI/OC/Kexts
+    extract $cache_dir/AppleALC*.zip "AppleALC.kext" $lomnt/EFI/OC/Kexts
+
+    trace "Copying extra EFI drivers"
+    cp $cache_dir/HfsPlus.efi $lomnt/EFI/OC/Drivers/
+
+    trace "Copying SSDTs"
+    cp $cache_dir/*.aml $lomnt/EFI/OC/ACPI
+
+    trace "Copying config.plist"
+    if [ ! -f $lomnt/EFI/OC/config.plist ]; then
+        extract $cache_dir/OpenCore*.zip "Docs/Sample.plist" $lomnt/EFI/OC/config.plist
+    fi
+}
+
+entrypoint() {
+    info "Fetching artifacts"
+    fetch_artifacts
+
+    local img=opencore.img
+    info "Creating $img"
+    if [ ! -f $img ]; then
+        trace "Making new opencore image"
+        make_img $img
+    else
+        trace "Existing opencore image found, skipping creation"
+    fi
+
+    info "Preparing image"
+    prepare_img $img
+}
+
+entrypoint
